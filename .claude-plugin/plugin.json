@@ -1,7 +1,7 @@
 {
   "name": "usage-glance",
   "displayName": "Usage Glance",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Claude and Codex plan limits in one quiet line above the prompt of the Claude desktop app",
   "author": {
     "name": "Ray",
@@ -22,12 +22,7 @@
     "codex": {
       "type": "string",
       "title": "Codex",
-      "description": "auto shows Codex while it is in use with a ChatGPT plan, and hides it when signed out or unused here for a week; always and never override that",
-      "options": [
-        "auto",
-        "always",
-        "never"
-      ],
+      "description": "auto (default) shows Codex while it is in use and hides it when signed out or unused here for a week; always shows it; never leaves it out",
       "default": "auto"
     }
   }

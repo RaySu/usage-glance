@@ -25,7 +25,7 @@ import {
   savedAt,
   withContext,
 } from './state'
-import type { $, ApiState, CodexState, ScanEntry } from './state'
+import type { ApiState, CodexState, Engine, ScanEntry } from './state'
 
 // The engine reads which state a module uses from the module itself, so the atom is declared here.
 const view = atom({ plugin: 'usage-glance', key: 'view' } as const, EMPTY)
@@ -61,10 +61,9 @@ const SCAN_OVERLAP = 8 * 1024
 const LEASE_MS = MIN
 /** Signed out but a session log was just written: look again this soon, at most. */
 const CODEX_SIGNIN_RECHECK_MS = 5 * MIN
-/** A cold read looks for the last task event in this much of the file's end first. */
-const TAIL_BYTES = 4 * 1024 * 1024
+/** A cold read looks for the last task event in this much of the file's end first: under the 4 MiB a process read holds. */
+const TAIL_BYTES = 3 * 1024 * 1024
 
-const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const CLAUDE_USAGE_PAGE = 'https://claude.ai/settings/usage'
 const CODEX_USAGE_PAGE = 'https://chatgpt.com/codex/settings/usage'
 
@@ -74,11 +73,11 @@ const CODEX_USAGE_PAGE = 'https://chatgpt.com/codex/settings/usage'
  * Claude keys are per account. With no account known they are kept in this
  * session only, never under a key another account could share.
  */
-async function claudeGet($: $, key: string) {
+async function claudeGet($: Engine, key: string) {
   return rt.account ? $.store.get(key) : rt.memory.get(key)
 }
 
-async function claudeSet($: $, key: string, value: unknown) {
+async function claudeSet($: Engine, key: string, value: unknown) {
   if (rt.account) await $.store.set(key, value)
   else rt.memory.set(key, value)
 }
@@ -87,7 +86,7 @@ async function claudeSet($: $, key: string, value: unknown) {
  * One session at a time does a shared ask; the lease expires by itself. The store
  * has no compare-and-set, so two sessions can, rarely, both ask: harmless.
  */
-async function takeLease($: $, name: string) {
+async function takeLease($: Engine, name: string) {
   const now = await $.clock.now()
   const held = (await $.store.get(`lease:${name}`)) as { owner: string; until: number } | undefined
   if (held && held.owner !== rt.owner && held.until > now && !isAhead(held.until, now, LEASE_MS)) return false
@@ -97,28 +96,28 @@ async function takeLease($: $, name: string) {
   return after?.owner === rt.owner
 }
 
-async function readCodexState($: $) {
+async function readCodexState($: Engine) {
   return ((await $.store.get(codexStateKey())) ?? { error: null }) as CodexState
 }
 
 /** Merges into the shared Codex state, so one write never drops another's fields. */
-async function setCodexState($: $, patch: Partial<CodexState>) {
+async function setCodexState($: Engine, patch: Partial<CodexState>) {
   await $.store.set(codexStateKey(), { ...(await readCodexState($)), ...patch })
 }
 
-async function holdsLease($: $, name: string) {
+async function holdsLease($: Engine, name: string) {
   const held = (await $.store.get(`lease:${name}`)) as { owner: string } | undefined
   return held?.owner === rt.owner
 }
 
-async function saveClaude($: $, reading: ClaudeReading) {
+async function saveClaude($: Engine, reading: ClaudeReading) {
   const stored = (await claudeGet($, claudeKey())) as ClaudeReading | undefined
   if (!stored || savedAt(stored) < savedAt(reading) || isAhead(savedAt(stored), savedAt(reading)))
     await claudeSet($, claudeKey(), reading)
 }
 
 /** Takes whatever newer readings other sessions saved. */
-async function adopt($: $) {
+async function adopt($: Engine) {
   const claude = (await claudeGet($, claudeKey())) as ClaudeReading | undefined
   const api = (await claudeGet($, apiKey())) as ApiState | undefined
   const codex = (await $.store.get(codexKey())) as CodexReading | undefined
@@ -146,7 +145,7 @@ async function adopt($: $) {
 // --- host facts --------------------------------------------------------------
 
 /** Local UTC offset from the host clock, since the module has no time zone of its own. */
-async function refreshOffset($: $) {
+async function refreshOffset($: Engine) {
   rt.offsetAt = await $.clock.now()
   try {
     const z = (await $.process.run(['/bin/date', '+%z'], { timeoutMs: 3_000 })).stdout.trim()
@@ -160,7 +159,7 @@ async function refreshOffset($: $) {
  * An app started from the Dock may have a short PATH: add the usual install places,
  * the Node version managers' included.
  */
-async function setUpPath($: $) {
+async function setUpPath($: Engine) {
   rt.home = (await $.env.get('HOME')) ?? ''
   rt.codexHome = (await $.env.get('CODEX_HOME')) || `${rt.home}/.codex`
   const path = (await $.env.get('PATH')) ?? ''
@@ -174,7 +173,7 @@ async function setUpPath($: $) {
   rt.pathEnv = [...new Set([...path.split(':'), ...usual, ...nvmBins, ...fnm])].filter(Boolean).join(':')
 }
 
-async function findOnPath($: $, name: string) {
+async function findOnPath($: Engine, name: string) {
   for (const dir of rt.pathEnv.split(':')) {
     if (dir && (await $.fs.exists(`${dir}/${name}`))) return `${dir}/${name}`
   }
@@ -186,7 +185,7 @@ async function findOnPath($: $, name: string) {
  * (the helper is a node script) can be found. Anything less leaves the Codex group
  * out instead of showing a Codex that can never update.
  */
-async function probeCodex($: $) {
+async function probeCodex($: Engine) {
   rt.codexProbedAt = await $.clock.now()
   rt.nodePath = await findOnPath($, 'node')
   rt.codexPath = await findOnPath($, 'codex')
@@ -195,8 +194,11 @@ async function probeCodex($: $) {
     const bundled = `${app}/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`
     if (!rt.codexPath && (await $.fs.exists(bundled))) rt.codexPath = bundled
   }
-  // The log scan uses the macOS shell tools; without them (Windows) Codex is left out.
-  const hasTools = (await $.fs.exists('/bin/sh')) && (await $.fs.exists('/usr/bin/find'))
+  // The log scan runs the macOS command-line tools; without them (Windows) Codex is left out.
+  let hasTools = true
+  for (const tool of ['/usr/bin/find', '/usr/bin/stat', '/usr/bin/head', '/usr/bin/tail', '/usr/bin/grep']) {
+    if (!(await $.fs.exists(tool))) hasTools = false
+  }
   rt.hasCodex =
     rt.setting !== 'never' && hasTools && !!rt.nodePath && !!rt.codexPath && (await $.fs.exists(rt.codexHome))
   // A Codex found is drawn once its mode is known (refreshCodexMode); one lost goes now.
@@ -208,7 +210,7 @@ async function probeCodex($: $) {
  * the config file missing, caught mid-write, or too large to read (4 MiB). Not being
  * able to tell is not a change of account.
  */
-async function findAccount($: $): Promise<string | undefined> {
+async function findAccount($: Engine): Promise<string | undefined> {
   const fromEnv = await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')
   if (fromEnv) return fromEnv
   const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) || rt.home
@@ -223,7 +225,7 @@ async function findAccount($: $): Promise<string | undefined> {
 // --- Claude: pushed by the engine --------------------------------------------
 
 async function takeMeasure(
-  $: $,
+  $: Engine,
   m: {
     rateLimits: { kind: string; percentUsed: number; resetsAt?: string }[]
     context: { tokens?: number; percent?: number }
@@ -247,7 +249,7 @@ async function takeMeasure(
 
 // --- Claude: the plan usage request the app itself makes ---------------------
 
-async function fetchClaude($: $, isForced = false) {
+async function fetchClaude($: Engine, isForced = false) {
   if (rt.isClaudeFetching) return
   rt.isClaudeFetching = true
   let now = 0
@@ -297,7 +299,7 @@ async function fetchClaude($: $, isForced = false) {
     }
     // A slow authorize can outlast the lease: send only while it is still ours.
     if (rt.account && !(await holdsLease($, `claude-api:${rt.account}`))) return
-    const res = await $.http.fetch(USAGE_URL, {
+    const res = await $.http.fetch('https://api.anthropic.com/api/oauth/usage', {
       auth: auth.handle,
       headers: { 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' },
     })
@@ -336,7 +338,7 @@ async function fetchClaude($: $, isForced = false) {
 
 // --- Codex: limits through the local app-server ------------------------------
 
-async function fetchCodex($: $, isForced = false) {
+async function fetchCodex($: Engine, isForced = false) {
   if (rt.isCodexFetching || !rt.hasCodex) return
   rt.isCodexFetching = true
   let now = 0
@@ -418,7 +420,7 @@ async function fetchCodex($: $, isForced = false) {
  * `codex login status`: a quick answer (no app-server) to whether Codex is signed in,
  * for looking again while it is signed out. Undefined when it cannot tell.
  */
-async function checkLogin($: $): Promise<CodexAuth | undefined> {
+async function checkLogin($: Engine): Promise<CodexAuth | undefined> {
   try {
     const run = await $.process.run([rt.codexPath, 'login', 'status'], { env: { PATH: rt.pathEnv }, timeoutMs: 10_000 })
     const text = `${run.stdout}\n${run.stderr}`
@@ -429,7 +431,7 @@ async function checkLogin($: $): Promise<CodexAuth | undefined> {
 }
 
 /** Signed out, or hidden: look again every 6 hours, cheaply first. */
-async function recheckQuietCodex($: $, now: number) {
+async function recheckQuietCodex($: Engine, now: number) {
   await setCodexState($, { attemptAt: now })
   const auth = await checkLogin($)
   if (auth === undefined) return
@@ -442,7 +444,7 @@ async function recheckQuietCodex($: $, now: number) {
  * Whether the Codex group shows, written in one go with whether Codex is here at all,
  * so a Codex that is to stay hidden never shows for a moment first.
  */
-async function refreshCodexMode($: $, now: number) {
+async function refreshCodexMode($: Engine, now: number) {
   const v = await read($, view)
   let mode = v.codexMode
   if (rt.hasCodex) {
@@ -466,70 +468,102 @@ async function refreshCodexMode($: $, now: number) {
 // --- Codex: tasks in progress, from its session logs -------------------------
 
 /**
- * The session logs written in the last `ms`, newest first, from anywhere under
- * sessions/: a resumed old conversation keeps writing the file of the day it began.
+ * `stat` lines, in `format`, for the session logs written in the last `ms`, from
+ * anywhere under sessions/: a resumed old conversation keeps writing the file of the
+ * day it began. Each tool is run directly with its arguments, never through a shell.
  */
-async function findRollouts($: $, ms: number) {
+async function statRollouts($: Engine, ms: number, format: string) {
   const run = await $.process.run(
     [
-      '/bin/sh',
-      '-c',
-      `/usr/bin/find "$1" -name 'rollout-*.jsonl' -mmin -"$2" -exec /usr/bin/stat -f '%m %z %N' {} +`,
-      'sh',
+      '/usr/bin/find',
       `${rt.codexHome}/sessions`,
-      String(Math.ceil(ms / MIN)),
+      '-name',
+      'rollout-*.jsonl',
+      '-mmin',
+      `-${Math.ceil(ms / MIN)}`,
+      '-exec',
+      '/usr/bin/stat',
+      '-f',
+      format,
+      '{}',
+      '+',
     ],
     { timeoutMs: 10_000 },
   )
+  return run.stdout.split('\n')
+}
+
+/** The session logs written in the last `ms`, newest first. */
+async function findRollouts($: Engine, ms: number) {
   const files: { path: string; mtimeMs: number; size: number }[] = []
-  for (const line of run.stdout.split('\n')) {
+  for (const line of await statRollouts($, ms, '%m %z %N')) {
     const m = /^(\d+) (\d+) (.+)$/.exec(line)
     if (m) files.push({ mtimeMs: Number(m[1]) * 1000, size: Number(m[2]), path: m[3]! })
   }
   return files.sort((a, b) => b.mtimeMs - a.mtimeMs)
 }
 
+/** The newest session-log write in the last `ms`, or 0. */
+async function newestRollout($: Engine, ms: number) {
+  let newest = 0
+  for (const line of await statRollouts($, ms, '%m')) {
+    const sec = Number(line)
+    if (line && Number.isFinite(sec) && sec * 1000 > newest) newest = sec * 1000
+  }
+  return newest
+}
+
+/** A task event line, as grep finds it in a whole file and as the scan reads it from a part. */
 const TASK_EVENTS = '^\\{"timestamp":"[^"]+",[^{]{0,200}\\{"type":"(task_started|task_complete|turn_aborted)"'
+const TASK_EVENT_LINE = new RegExp(TASK_EVENTS, 'gm')
+
+/** Applies the task events found in `text`, in order, to `entry`. */
+function applyEvents(entry: ScanEntry, text: string) {
+  for (const m of text.matchAll(TASK_EVENT_LINE)) {
+    entry.lastKind = m[1]!
+    if (m[1] === 'task_started') entry.startedAt = Date.parse(/"timestamp":"([^"]+)"/.exec(m[0])?.[1] ?? '')
+  }
+}
+
+/**
+ * The last task events of a whole file: from its end first, and the whole file only
+ * when the end has none (session logs reach hundreds of MB).
+ */
+async function readLastEvents($: Engine, path: string, entry: ScanEntry) {
+  const end = await $.process.run(['/usr/bin/tail', '-c', String(TAIL_BYTES), path], { timeoutMs: 5_000 })
+  const before = entry.lastKind
+  entry.lastKind = ''
+  applyEvents(entry, end.stdout)
+  if (entry.lastKind) return
+  const all = await $.process.run(['/usr/bin/grep', '-o', '-E', TASK_EVENTS, path], { timeoutMs: 5_000 })
+  applyEvents(entry, all.stdout)
+  if (!entry.lastKind) entry.lastKind = before
+}
 
 /**
  * Reads a session file's task events from byte `from` on: the whole file the first
  * time (with its first line, which tells a subagent apart), then only what was added.
  */
-async function readEvents($: $, path: string, from: number, prev: ScanEntry): Promise<ScanEntry> {
-  // A cold read: the first line first (a subagent needs nothing more), then the last
-  // task events from the file's end, the whole file only when the end has none
-  // (session logs reach hundreds of MB).
-  const grep = `/usr/bin/grep -o -E '${TASK_EVENTS}'`
-  const script =
-    from === 0
-      ? [
-          `h=$(head -c ${HEAD_BYTES} "$1"); printf '%s\\n<<head>>\\n' "$h"`,
-          `case "$h" in *'"thread_source":"subagent"'*) exit 0 ;; esac`,
-          `ev=$(tail -c ${TAIL_BYTES} "$1" | ${grep} | tail -n 3)`,
-          `[ -n "$ev" ] || ev=$(${grep} "$1" | tail -n 3)`,
-          `printf '%s\\n' "$ev"`,
-        ].join('\n')
-      : `tail -c +"$2" "$1" | ${grep} | tail -n 3`
-  const run = await $.process.run(['/bin/sh', '-c', script, 'sh', path, String(from + 1)], { timeoutMs: 5_000 })
+async function readEvents($: Engine, path: string, from: number, prev: ScanEntry): Promise<ScanEntry> {
   const entry = { ...prev }
-  if (from === 0) {
-    const head = run.stdout.split('\n<<head>>\n')[0] ?? ''
-    // A subagent a Codex task spawned is part of that task, not a task of its own. The
-    // first line can be caught half written; it is read again until it is whole.
-    entry.isSubagent = /"thread_source":"subagent"/.test(head)
-    entry.isHeadKnown = entry.isSubagent || head.includes('\n') || head.length >= HEAD_BYTES
+  if (from > 0) {
+    const added = await $.process.run(['/usr/bin/tail', '-c', `+${from + 1}`, path], { timeoutMs: 5_000 })
+    // Grown by more than one read holds: the end is what counts, read as a whole file's.
+    if (added.isStdoutTruncated) await readLastEvents($, path, entry)
+    else applyEvents(entry, added.stdout)
+    return entry
   }
-  for (const line of run.stdout.split('\n')) {
-    const kind = /\{"type":"(task_started|task_complete|turn_aborted)"/.exec(line)?.[1]
-    if (!kind) continue
-    entry.lastKind = kind
-    if (kind === 'task_started') entry.startedAt = Date.parse(/"timestamp":"([^"]+)"/.exec(line)?.[1] ?? '')
-  }
+  const head = (await $.process.run(['/usr/bin/head', '-c', String(HEAD_BYTES), path], { timeoutMs: 5_000 })).stdout
+  // A subagent a Codex task spawned is part of that task, not a task of its own. The
+  // first line can be caught half written; it is read again until it is whole.
+  entry.isSubagent = /"thread_source":"subagent"/.test(head)
+  entry.isHeadKnown = entry.isSubagent || head.includes('\n') || head.length >= HEAD_BYTES
+  if (!entry.isSubagent) await readLastEvents($, path, entry)
   return entry
 }
 
 /** The Codex tasks running now; null while an earlier scan is still going. */
-async function scanCodex($: $): Promise<{ newest: number; tasks: CodexTask[] } | null> {
+async function scanCodex($: Engine): Promise<{ newest: number; tasks: CodexTask[] } | null> {
   if (rt.isScanning) return null
   rt.isScanning = true
   try {
@@ -572,7 +606,7 @@ async function scanCodex($: $): Promise<{ newest: number; tasks: CodexTask[] } |
  * One session scans for all: the result is shared through the store for a little
  * under a minute, so ten open sessions do not scan ten times.
  */
-async function sharedScan($: $, now: number): Promise<{ newest: number; tasks: CodexTask[] } | null> {
+async function sharedScan($: Engine, now: number): Promise<{ newest: number; tasks: CodexTask[] } | null> {
   const key = `codex-scan:${rt.codexHome}`
   const shared = (await $.store.get(key)) as { at: number; newest: number; tasks: CodexTask[] } | undefined
   if (shared && now - shared.at < 50_000 && !isAhead(shared.at, now)) return shared
@@ -582,32 +616,15 @@ async function sharedScan($: $, now: number): Promise<{ newest: number; tasks: C
   return scan
 }
 
-/** The newest session-log write in the last `ms`, or 0: one line, however many logs. */
-async function newestRollout($: $, ms: number) {
-  const run = await $.process.run(
-    [
-      '/bin/sh',
-      '-c',
-      `/usr/bin/find "$1" -name 'rollout-*.jsonl' -mmin -"$2" -exec /usr/bin/stat -f '%m' {} + | /usr/bin/sort -rn | /usr/bin/head -n 1`,
-      'sh',
-      `${rt.codexHome}/sessions`,
-      String(Math.ceil(ms / MIN)),
-    ],
-    { timeoutMs: 10_000 },
-  )
-  const sec = Number(run.stdout.trim())
-  return Number.isFinite(sec) && sec > 0 ? sec * 1000 : 0
-}
-
 // --- the minute tick ---------------------------------------------------------
 
 /** A failure goes to the debug log (`claude --debug`), never to the transcript. */
-function logFailure($: $, where: string, err: unknown) {
+function logFailure($: Engine, where: string, err: unknown) {
   $.ui.log(`${where} failed: ${(err as Error)?.message ?? err}`, { to: 'debug' })
 }
 
 /** The minute timer; a failure is logged, never swallowed. */
-async function safeTick($: $) {
+async function safeTick($: Engine) {
   try {
     await tick($)
   } catch (err) {
@@ -615,7 +632,7 @@ async function safeTick($: $) {
   }
 }
 
-async function tick($: $) {
+async function tick($: Engine) {
   // Nothing is drawn outside the desktop app (a terminal, an IDE, a -p run): no work
   // either. Checked every minute, since the app can attach to a session later.
   if (!rt.isOnDesktop) {
@@ -653,7 +670,7 @@ async function tick($: $) {
  * The minute's Codex work: the log scan, whether to show Codex, and whether to ask
  * for its limits now.
  */
-async function tickCodex($: $, now: number) {
+async function tickCodex($: Engine, now: number) {
   if (!rt.hasCodex && now - rt.codexProbedAt >= CODEX_PROBE_EVERY_MS) await setUpCodex($)
   if (!rt.hasCodex) return
   if (!rt.isLastUseKnown) await lookBack($)
@@ -701,7 +718,7 @@ async function tickCodex($: $, now: number) {
 // --- starting up -------------------------------------------------------------
 
 /** Re-reads the Claude account: a /login to another account must not mix two accounts' readings. */
-async function refreshAccount($: $) {
+async function refreshAccount($: Engine) {
   rt.accountAt = await $.clock.now()
   const account = await findAccount($)
   if (account === undefined || account === rt.account) return
@@ -711,14 +728,14 @@ async function refreshAccount($: $) {
 }
 
 /** What only the desktop app needs: host probes, Codex, the first readings. */
-async function setUp($: $) {
+async function setUp($: Engine) {
   rt.isSetUp = true
   await refreshOffset($)
   await setUpCodex($)
 }
 
 /** The last use of Codex here, back past the 7-day rule; a find that times out is tried again next minute. */
-async function lookBack($: $) {
+async function lookBack($: Engine) {
   try {
     rt.lastLocalUseAt = Math.max(rt.lastLocalUseAt, await newestRollout($, LOCAL_USE_LOOKBACK_MS))
     rt.isLastUseKnown = true
@@ -726,7 +743,7 @@ async function lookBack($: $) {
 }
 
 /** Is Codex installed, signed in, used here? */
-async function setUpCodex($: $) {
+async function setUpCodex($: Engine) {
   await probeCodex($)
   if (!rt.hasCodex) return
   const now = await $.clock.now()
@@ -739,7 +756,7 @@ async function setUpCodex($: $) {
   await refreshCodexMode($, now)
 }
 
-async function start($: $) {
+async function start($: Engine) {
   await setUpPath($)
   rt.account = (await findAccount($)) ?? rt.account
   rt.accountAt = await $.clock.now()
@@ -772,7 +789,7 @@ async function start($: $) {
  * What /usage-glance prints: the numbers, then what a bug report needs. No account
  * ids, and the home folder written as ~.
  */
-async function report($: $) {
+async function report($: Engine) {
   const v = await read($, view)
   const now = await $.clock.now()
   const at = (t: number) => clock(t, now, v.utcOffsetMin)
@@ -802,7 +819,7 @@ async function report($: $) {
           ? 'found, but not node, which reads its limits'
           : !(await $.fs.exists(rt.codexHome))
             ? 'found, but not its folder (never run, or CODEX_HOME points elsewhere)'
-            : 'found, but not the macOS shell tools it needs'
+            : 'found, but not the macOS command-line tools it needs'
   const codexLine = !v.hasCodex
     ? missing
     : [
@@ -921,7 +938,7 @@ export const register: Register = (on, options) => {
 
 type BandEvent = RenderInputOf<'AbovePrompt', 'desktop'>
 
-async function drawBand($: $, e: BandEvent, next: (e: BandEvent) => Promise<RenderElement>) {
+async function drawBand($: Engine, e: BandEvent, next: (e: BandEvent) => Promise<RenderElement>) {
   // Countdowns use the time of this draw, not the last tick's.
   const v: View = { ...(await read($, view)), now: await $.clock.now() }
   const { Box, Text, Svg } = $.ui.resolve(e)

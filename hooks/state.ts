@@ -74,7 +74,8 @@ export function withContext(v: View, context: { percent?: number; tokens?: numbe
 // ---------------------------------------------------------------------------
 // Runtime (module variables start over on every reload; $.state and $.store stay)
 
-export type $ = EngineInterface
+/** The engine interface every hook receives as `$`. */
+export type Engine = EngineInterface
 
 export type ApiState = { error: string | null; nextAt?: number; failures?: number; stoppedAt?: number }
 

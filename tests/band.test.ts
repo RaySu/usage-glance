@@ -494,6 +494,8 @@ type Host = {
   /** Today's Codex session logs, and what reading one answers (its path, and the byte it reads from). */
   logs?: () => SessionLog[]
   readLog?: (path: string, from: number) => string
+  /** True while what was added to a log is more than one read holds. */
+  isAddedTruncated?: () => boolean
 }
 
 /**
@@ -504,7 +506,7 @@ type Host = {
  */
 function host(
   on: On,
-  { apiReply, authKind = 'bearer', codexReply, surfaces = ['desktop'], hasNode = true, hasCodexCommand = true, hasCodexHome = true, isSignedIn = true, logs, readLog }: Host = {},
+  { apiReply, authKind = 'bearer', codexReply, surfaces = ['desktop'], hasNode = true, hasCodexCommand = true, hasCodexHome = true, isSignedIn = true, logs, readLog, isAddedTruncated }: Host = {},
 ) {
   const asked = { codex: 0, authorize: 0, api: 0, login: 0, reads: [] as number[] }
   const today = '/h/.codex/sessions/2026/10/04'
@@ -527,20 +529,32 @@ function host(
       asked.login += 1
       return { value: isSignedIn ? { exitCode: 0, stdout: 'Logged in using ChatGPT\n', stderr: '' } : { exitCode: 1, stdout: '', stderr: 'Not logged in\n' } } as never
     }
-    if (e.argv[0] === '/bin/sh' && e.argv[2]?.includes('/usr/bin/find')) {
-      // find -mmin -N, answered with `stat -f '%m %z %N'` lines, or the newest `%m` alone.
-      const minutes = Number(e.argv[5])
+    const ok = (stdout: string, isStdoutTruncated = false) =>
+      ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated, isStderrTruncated: false } }) as never
+    if (e.argv[0] === '/usr/bin/find') {
+      // find -mmin -N -exec stat -f FORMAT: `%m %z %N` lines, or `%m` alone.
+      const minutes = Number(e.argv[5]?.slice(1))
       const recent = (logs?.() ?? []).filter(l => l.ageMs < minutes * MIN)
       const sec = (l: SessionLog) => Math.floor((NOW - l.ageMs) / 1000)
-      const lines = e.argv[2].includes('sort -rn')
-        ? recent.map(sec).sort((a, b) => b - a).slice(0, 1).map(String)
-        : recent.map(l => `${sec(l)} ${l.size} ${today}/${l.name}`)
-      return { value: { exitCode: 0, stdout: lines.join('\n') + (lines.length ? '\n' : ''), stderr: '' } } as never
+      const lines = e.argv[9] === '%m' ? recent.map(l => String(sec(l))) : recent.map(l => `${sec(l)} ${l.size} ${today}/${l.name}`)
+      return ok(lines.join('\n') + (lines.length ? '\n' : ''))
     }
-    if (e.argv[0] === '/bin/sh') {
-      const from = Number(e.argv[2]?.includes('head -c') ? 0 : e.argv[5])
-      asked.reads.push(from)
-      return { value: { exitCode: 0, stdout: readLog?.(e.argv[4] ?? '', from) ?? '', stderr: '' } } as never
+    // The log reads: a whole file's text is readLog(path, 0); what was added from byte N
+    // on (1-based, as `tail -c +N` counts) is readLog(path, N).
+    const path = e.argv[e.argv.length - 1] ?? ''
+    if (e.argv[0] === '/usr/bin/head') {
+      asked.reads.push(0)
+      return ok((readLog?.(path, 0) ?? '').slice(0, Number(e.argv[2])))
+    }
+    if (e.argv[0] === '/usr/bin/tail') {
+      const at = e.argv[2] ?? ''
+      if (!at.startsWith('+')) return ok((readLog?.(path, 0) ?? '').slice(-Number(at)))
+      asked.reads.push(Number(at.slice(1)))
+      return ok(readLog?.(path, Number(at.slice(1))) ?? '', isAddedTruncated?.() ?? false)
+    }
+    if (e.argv[0] === '/usr/bin/grep') {
+      const text = readLog?.(path, 0) ?? ''
+      return ok([...text.matchAll(new RegExp(e.argv[3] ?? '', 'gm'))].map(m => m[0]).join('\n'))
     }
     asked.codex += 1
     const result = { rateLimits: { limitId: 'codex', primary: { usedPercent: 47, windowDurationMins: 10080, resetsAt: Math.round((NOW + 5 * 24 * HOUR) / 1000) }, secondary: null } }
@@ -795,6 +809,33 @@ describe('drawn on the desktop surface', () => {
     expect((await ui.findAll({ type: 'Text' })).some(t => t.text?.startsWith('Running'))).toBe(true)
     // Each subagent log is read once, not again every other minute.
     expect(asked.reads.length).toBeLessThanOrEqual(49)
+  })
+
+  test('a log that grew past what one read holds is read from its end', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'engine', ref: 1 }) as never)
+    const event = (kind: string, at: number) => `{"timestamp":"${new Date(at).toISOString()}","ordinal":1,"type":"event_msg","payload":{"type":"${kind}"`
+    let size = 100_000
+    let isDone = false
+    host(on, {
+      logs: () => [{ name: 'rollout-a.jsonl', size, ageMs: 20_000 }],
+      // The added part is cut off before the task's end; the file's end has it.
+      readLog: (_path, from) =>
+        from === 0
+          ? `{"type":"session_meta","payload":{"originator":"codex_exec"}}\n${event('task_started', NOW - 3 * MIN)}${isDone ? `\n${event('task_complete', NOW)}` : ''}`
+          : 'x'.repeat(100),
+      isAddedTruncated: () => isDone,
+    })
+    await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+    await clock.advance(1_000)
+    const ui = await $.ui.mount({ plugin: 'usage-glance', surface: 'desktop', component: 'AbovePrompt', props })
+    expect(await ui.find({ type: 'Text', text: 'Running 3m' })).not.toBe(undefined)
+    size = 9_000_000
+    isDone = true
+    await clock.advance(MIN)
+    const ui2 = await $.ui.mount({ plugin: 'usage-glance', surface: 'desktop', component: 'AbovePrompt', props })
+    expect((await ui2.findAll({ type: 'Text' })).map(t => t.text).some(t => t.startsWith('Running'))).toBe(false)
   })
 
   test('a log caught with its first line half written is read whole again', async ($, on) => {
