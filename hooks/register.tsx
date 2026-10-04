@@ -850,90 +850,6 @@ async function report($: Engine) {
   return rt.home ? text.split(rt.home).join('~') : text
 }
 
-// -----------------------------------------------------------------------------
-// The module
-
-export const register: Register = (on, options) => {
-  rt.setting = options.codex === 'always' || options.codex === 'never' ? options.codex : 'auto'
-
-  // --- events ----------------------------------------------------------------
-
-  on('session.start', async ($, e, next) => {
-    const started = await next(e)
-    try {
-      await $.command.register({
-        name: 'usage-glance',
-        description: 'Refresh the usage band and print its numbers',
-        immediate: true,
-      })
-      await start($)
-    } catch (err) {
-      logFailure($, 'starting', err)
-    }
-    return started
-  })
-
-  // /clear, /resume and /branch reset $.state without a new session.start.
-  on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
-    const done = await next(e)
-    try {
-      // A reload fires session.start again; this covers a host that would not.
-      if (!rt.isStarted) await start($)
-      await refreshAccount($)
-      const usage = await $.session.usage()
-      const now = await $.clock.now()
-      await update($, view, () =>
-        withContext({ ...EMPTY, utcOffsetMin: rt.utcOffsetMin, now }, usage.context, usage.cost?.usd),
-      )
-      await adopt($)
-      await refreshCodexMode($, now)
-    } catch (err) {
-      logFailure($, 'starting over after /clear, /resume or /branch', err)
-    }
-    return done
-  })
-
-  on('session.measure', async ($, e, next) => {
-    try {
-      await takeMeasure($, e)
-    } catch (err) {
-      logFailure($, 'reading a measurement', err)
-    }
-    return next(e)
-  })
-
-  on('turn.complete', async ($, e, next) => {
-    const now = await $.clock.now()
-    await update($, view, v => ({ ...v, lastTurnAt: now, now }))
-    return next(e)
-  })
-
-  on('command.run', { command: 'usage-glance' }, async $ => {
-    if (!rt.isStarted) await start($)
-    // Asked for by hand, so it answers anywhere, the terminal included.
-    if (!rt.isSetUp) await setUp($)
-    await Promise.all([fetchClaude($, true), fetchCodex($, true)])
-    return { text: await report($) }
-  })
-
-  // --- drawing -----------------------------------------------------------------
-
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.surface !== 'desktop' || e.props.hasSurvey) return next(e)
-    if (!rt.isOnDesktop) {
-      // Drawn on the desktop app: the minute work can start now, not at the next tick.
-      rt.isOnDesktop = true
-      rt.kick?.()
-    }
-    try {
-      return await drawBand($, e, next)
-    } catch (err) {
-      logFailure($, 'drawing the band', err)
-      return next(e)
-    }
-  })
-}
-
 // --- drawing -----------------------------------------------------------------
 
 type BandEvent = RenderInputOf<'AbovePrompt', 'desktop'>
@@ -1063,4 +979,88 @@ ${tickX !== null ? `<rect class="k" x="${(tickX - 0.75).toFixed(2)}" y="0" width
   ) : (
     band
   )
+}
+
+// -----------------------------------------------------------------------------
+// The module
+
+export const register: Register = (on, options) => {
+  rt.setting = options.codex === 'always' || options.codex === 'never' ? options.codex : 'auto'
+
+  // --- events ----------------------------------------------------------------
+
+  on('session.start', async ($, e, next) => {
+    const started = await next(e)
+    try {
+      await $.command.register({
+        name: 'usage-glance',
+        description: 'Refresh the usage band and print its numbers',
+        immediate: true,
+      })
+      await start($)
+    } catch (err) {
+      logFailure($, 'starting', err)
+    }
+    return started
+  })
+
+  // /clear, /resume and /branch reset $.state without a new session.start.
+  on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
+    const done = await next(e)
+    try {
+      // A reload fires session.start again; this covers a host that would not.
+      if (!rt.isStarted) await start($)
+      await refreshAccount($)
+      const usage = await $.session.usage()
+      const now = await $.clock.now()
+      await update($, view, () =>
+        withContext({ ...EMPTY, utcOffsetMin: rt.utcOffsetMin, now }, usage.context, usage.cost?.usd),
+      )
+      await adopt($)
+      await refreshCodexMode($, now)
+    } catch (err) {
+      logFailure($, 'starting over after /clear, /resume or /branch', err)
+    }
+    return done
+  })
+
+  on('session.measure', async ($, e, next) => {
+    try {
+      await takeMeasure($, e)
+    } catch (err) {
+      logFailure($, 'reading a measurement', err)
+    }
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const now = await $.clock.now()
+    await update($, view, v => ({ ...v, lastTurnAt: now, now }))
+    return next(e)
+  })
+
+  on('command.run', { command: 'usage-glance' }, async $ => {
+    if (!rt.isStarted) await start($)
+    // Asked for by hand, so it answers anywhere, the terminal included.
+    if (!rt.isSetUp) await setUp($)
+    await Promise.all([fetchClaude($, true), fetchCodex($, true)])
+    return { text: await report($) }
+  })
+
+  // --- drawing -----------------------------------------------------------------
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.surface !== 'desktop' || e.props.hasSurvey) return next(e)
+    if (!rt.isOnDesktop) {
+      // Drawn on the desktop app: the minute work can start now, not at the next tick.
+      rt.isOnDesktop = true
+      rt.kick?.()
+    }
+    try {
+      return await drawBand($, e, next)
+    } catch (err) {
+      logFailure($, 'drawing the band', err)
+      return next(e)
+    }
+  })
 }
