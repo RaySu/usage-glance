@@ -1,0 +1,57 @@
+# Every week, and on every push: does usage-glance still fit the newest Claude Code
+# and Codex? Nothing here signs in; the parts that need a sign-in (the Claude
+# plan-usage reply, real Codex limits) fail soft in the mod and are checked by hand.
+name: check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+
+jobs:
+  check:
+    # The Codex part uses the macOS shell tools.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the newest Claude Code and Codex
+        run: npm install --global @anthropic-ai/claude-code@latest @openai/codex@latest
+
+      - name: Versions
+        run: |
+          claude --version
+          codex --version
+
+      # The engine's own static analysis: every event, $ call and state value the
+      # module uses must still exist in this Claude Code.
+      - name: Validate
+        run: claude plugin validate --strict .
+
+      # The module run by the engine's test kit, with a mocked host.
+      - name: Test
+        run: claude plugin test .
+
+      # The app-server methods and fields the helper reads, and the session-log
+      # event names behind "Running".
+      - name: Codex still answers the same way
+        run: |
+          schema="$(mktemp -d)"
+          codex app-server generate-json-schema --out "$schema"
+          node scripts/check-codex.mjs "$schema"
+
+      - name: A signed-out Codex says so
+        run: |
+          home="$(mktemp -d)"
+          if CODEX_HOME="$home" codex login status > status.txt 2>&1; then
+            echo "expected a non-zero exit while signed out"; cat status.txt; exit 1
+          fi
+          grep -qi 'not logged in' status.txt
+          CODEX_HOME="$home" node bin/codex-limits.mjs "$(command -v codex)" | tee helper.json
+          grep -q '"error":"not signed in"' helper.json

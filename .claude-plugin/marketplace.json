@@ -1,0 +1,6 @@
+{
+  "name": "usage-glance",
+  "description": "Usage Glance: Claude and Codex plan limits above the prompt of the Claude desktop app",
+  "owner": { "name": "Ray" },
+  "plugins": [{ "name": "usage-glance", "source": "./" }]
+}
