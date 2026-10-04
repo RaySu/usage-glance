@@ -163,13 +163,13 @@ async function setUpPath($: Engine) {
   rt.home = (await $.env.get('HOME')) ?? ''
   rt.codexHome = (await $.env.get('CODEX_HOME')) || `${rt.home}/.codex`
   const path = (await $.env.get('PATH')) ?? ''
-  const h = rt.home
-  const nvm = `${h}/.nvm/versions/node`
+  const home = rt.home
+  const nvm = `${home}/.nvm/versions/node`
   const nvmBins = (await $.fs.exists(nvm))
     ? (await $.fs.list(nvm)).filter(d => d.kind === 'dir').map(d => `${nvm}/${d.name}/bin`).sort().reverse()
     : []
-  const usual = ['/opt/homebrew/bin', '/usr/local/bin', `${h}/.local/bin`, `${h}/.volta/bin`, `${h}/.asdf/shims`, `${h}/.bun/bin`, `${h}/.npm-global/bin`]
-  const fnm = [`${h}/.local/share/fnm/aliases/default/bin`, `${h}/Library/Application Support/fnm/aliases/default/bin`]
+  const usual = ['/opt/homebrew/bin', '/usr/local/bin', `${home}/.local/bin`, `${home}/.volta/bin`, `${home}/.asdf/shims`, `${home}/.bun/bin`, `${home}/.npm-global/bin`]
+  const fnm = [`${home}/.local/share/fnm/aliases/default/bin`, `${home}/Library/Application Support/fnm/aliases/default/bin`]
   rt.pathEnv = [...new Set([...path.split(':'), ...usual, ...nvmBins, ...fnm])].filter(Boolean).join(':')
 }
 

@@ -1,7 +1,7 @@
 {
   "name": "usage-glance",
   "displayName": "Usage Glance",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Claude and Codex plan limits in one quiet line above the prompt of the Claude desktop app",
   "author": {
     "name": "Ray",
@@ -9,6 +9,8 @@
   },
   "homepage": "https://github.com/RaySu/usage-glance",
   "repository": "https://github.com/RaySu/usage-glance",
+  "supportUrl": "https://github.com/RaySu/usage-glance/issues",
+  "privacyPolicyUrl": "https://github.com/RaySu/usage-glance#what-it-runs-sends-and-keeps",
   "license": "MIT",
   "keywords": [
     "usage",
