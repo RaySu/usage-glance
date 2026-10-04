@@ -3,7 +3,7 @@
 // (the engine follows $ only into its own functions); what the band shows is decided
 // in model.ts, replies are read in parse.ts, and state.ts holds what the session knows.
 import { atom, read, update } from 'claude-code'
-import type { Register, RenderElement, RenderInputOf } from 'claude-code'
+import type { Elements, Register, RenderElement } from 'claude-code'
 
 import type { ClaudeReading, CodexAuth, CodexReading, CodexTask, LimitWindow, View } from '../types'
 
@@ -852,13 +852,14 @@ async function report($: Engine) {
 
 // --- drawing -----------------------------------------------------------------
 
-type BandEvent = RenderInputOf<'AbovePrompt', 'desktop'>
-
-async function drawBand($: Engine, e: BandEvent, next: (e: BandEvent) => Promise<RenderElement>) {
-  // Countdowns use the time of this draw, not the last tick's.
-  const v: View = { ...(await read($, view)), now: await $.clock.now() }
-  const { Box, Text, Svg } = $.ui.resolve(e)
-  const m = bandModel(v, e.props.bodyColumns)
+/**
+ * The line itself, from the view and the desktop app's elements: no engine calls, so
+ * the render hook reads what it needs and hands it over. `theirs` is what the mods
+ * beneath drew in the band, if anything.
+ */
+function drawBand(ui: Elements['desktop'], v: View, bodyColumns: number, theirs: RenderElement) {
+  const { Box, Text, Svg } = ui
+  const m = bandModel(v, bodyColumns)
 
   const bar = (w: WindowModel, px: number) => {
     const pct = w.percentUsed === null ? 0 : Math.min(100, Math.max(0, w.percentUsed))
@@ -943,7 +944,6 @@ ${tickX !== null ? `<rect class="k" x="${(tickX - 0.75).toFixed(2)}" y="0" width
       {hasTail ? claudeTail : null}
     </Box>
   )
-  const theirs = await next(e)
   // With no other mod in the band, next(e) is the engine's empty placeholder; stacking
   // it under our line would leave a blank row.
   const hasTheirs = !!theirs && theirs.type !== 'engine'
@@ -1057,7 +1057,10 @@ export const register: Register = (on, options) => {
       rt.kick?.()
     }
     try {
-      return await drawBand($, e, next)
+      // Countdowns use the time of this draw, not the last tick's.
+      const v: View = { ...(await read($, view)), now: await $.clock.now() }
+      const ui = $.ui.resolve(e)
+      return drawBand(ui, v, e.props.bodyColumns, await next(e))
     } catch (err) {
       logFailure($, 'drawing the band', err)
       return next(e)
