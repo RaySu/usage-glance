@@ -1,5 +1,5 @@
-// Readings from what the two usage sources answer, as pure functions so tests can
-// feed them recorded replies. register.tsx does the asking.
+// Readings from what the two usage sources and the host's clock answer, as pure
+// functions so tests can feed them recorded replies. register.tsx does the asking.
 import type { ClaudeReading, CodexReading, LimitWindow } from '../types'
 
 import { HOUR, MIN, floor } from './model'
@@ -137,4 +137,23 @@ export function parseCodexLimits(result: unknown, now: number): CodexReading | n
     isPassReady: (isSpent(fiveHour) || isSpent(weekly)) && passes > 0,
     takenAt: now,
   }
+}
+
+/** Time zones run from UTC-12:00 to UTC+14:00; anything else is a misread. */
+const asOffset = (min: number) => (min >= -12 * 60 && min <= 14 * 60 ? min : null)
+
+/** The UTC offset in minutes from `date +%z` (`+0800`, `-0330`); null otherwise. */
+export function offsetFromDate(text: string): number | null {
+  const m = /^([+-])(\d\d)([0-5]\d)$/.exec(text.trim())
+  return m ? asOffset((m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3]))) : null
+}
+
+/**
+ * The UTC offset in minutes from Windows' `reg query ... /v ActiveTimeBias`: the bias in
+ * force now, daylight saving included, a 32-bit value with UTC = local time + bias
+ * (`0xfffffe20` is -480, UTC+08:00). Null when the reply holds no such value.
+ */
+export function offsetFromRegistry(text: string): number | null {
+  const m = /^\s*ActiveTimeBias\s+REG_DWORD\s+0x([0-9a-f]{1,8})\s*$/im.exec(text)
+  return m ? asOffset(0 - (parseInt(m[1]!, 16) | 0)) : null
 }

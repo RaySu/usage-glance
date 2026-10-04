@@ -17,7 +17,7 @@ Run validate, test and tsc after every change. `.github/workflows/check.yml` run
 
 - `hooks/register.tsx`: everything that takes `$` (events, timers, store, http, processes) and the drawing, plus `/usage-glance`.
 - `hooks/model.ts`: what the band shows, from the view alone (pure; most tests live here).
-- `hooks/parse.ts`: readings from the Claude plan-usage reply, reply headers, and the Codex app-server reply (pure).
+- `hooks/parse.ts`: readings from the Claude plan-usage reply, reply headers, the Codex app-server reply, and the host's time zone (`date +%z`, or the Windows registry) (pure).
 - `hooks/state.ts`: the runtime object `rt`, store keys, stored shapes, pure helpers.
 - `bin/codex-limits.mjs`: node helper that asks `codex app-server` (account/read, then account/rateLimits/read).
 - `types/index.d.ts`: the `$.state` contract (the `view` atom).

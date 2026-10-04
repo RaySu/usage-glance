@@ -496,6 +496,13 @@ type Host = {
   readLog?: (path: string, from: number) => string
   /** True while what was added to a log is more than one read holds. */
   isAddedTruncated?: () => boolean
+  /**
+   * Windows: no /bin/date or /usr/bin tools, a HOME a shell set apart from USERPROFILE,
+   * and the account in USERPROFILE's .claude.json.
+   */
+  isWindows?: boolean
+  /** What `reg query` prints for the time zone, or undefined when it cannot start. UTC-07:00 unless told. */
+  registry?: () => string | undefined
 }
 
 /**
@@ -506,11 +513,12 @@ type Host = {
  */
 function host(
   on: On,
-  { apiReply, authKind = 'bearer', codexReply, surfaces = ['desktop'], hasNode = true, hasCodexCommand = true, hasCodexHome = true, isSignedIn = true, logs, readLog, isAddedTruncated }: Host = {},
+  { apiReply, authKind = 'bearer', codexReply, surfaces = ['desktop'], hasNode = true, hasCodexCommand = true, hasCodexHome = true, isSignedIn = true, logs, readLog, isAddedTruncated, isWindows = false, registry }: Host = {},
 ) {
-  const asked = { codex: 0, authorize: 0, api: 0, login: 0, reads: [] as number[] }
+  const asked = { codex: 0, authorize: 0, api: 0, login: 0, reads: [] as number[], registry: [] as string[], registryReads: 0, files: [] as string[] }
   const today = '/h/.codex/sessions/2026/10/04'
-  mock.env(on, { HOME: '/h', PATH: '/usr/bin' })
+  const windowsEnv = { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\h', HOME: 'D:\\msys-home', SystemRoot: 'C:\\WINDOWS', PATH: 'C:\\WINDOWS\\system32' }
+  mock.env(on, isWindows ? windowsEnv : { HOME: '/h', PATH: '/usr/bin' })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.surfaces', () => ({ value: surfaces }) as never)
   on('fs.exists', (_$, e) => ({
@@ -518,13 +526,31 @@ function host(
       !e.path.includes('/.nvm/') &&
         (hasNode || !e.path.endsWith('/node')) &&
         (hasCodexCommand || !e.path.endsWith('/codex')) &&
-        (hasCodexHome || !e.path.endsWith('/.codex')),
+        (hasCodexHome || !e.path.endsWith('/.codex')) &&
+        !(isWindows && e.path.startsWith('/usr/bin/')),
   }))
-  on('fs.read', () => ({ deny: 'no such file' }))
+  on('fs.read', (_$, e) => {
+    asked.files.push(e.path)
+    // The test host is POSIX, so it resolves a Windows path against the plugin folder.
+    if (isWindows && e.path.endsWith('C:\\Users\\h/.claude.json')) return { value: JSON.stringify({ oauthAccount: { accountUuid: 'acct-1' } }) } as never
+    return { deny: 'no such file' }
+  })
   on('fs.write', () => ({ value: undefined }))
   on('fs.list', () => ({ value: [] }))
   on('process.run', (_$, e) => {
-    if (e.argv[0] === '/bin/date') return { value: { exitCode: 0, stdout: '+0800\n', stderr: '' } } as never
+    if (e.argv[0] === '/bin/date') {
+      if (isWindows) return { deny: 'spawn /bin/date ENOENT' }
+      return { value: { exitCode: 0, stdout: '+0800\n', stderr: '' } } as never
+    }
+    if (e.argv[0]?.endsWith('reg.exe')) {
+      asked.registry = [...e.argv]
+      asked.registryReads += 1
+      const stdout = registry
+        ? registry()
+        : '\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation\r\n    ActiveTimeBias    REG_DWORD    0x1a4\r\n\r\n'
+      if (stdout === undefined) return { deny: 'spawn reg.exe ENOENT' }
+      return { value: { exitCode: 0, stdout, stderr: '' } } as never
+    }
     if (e.argv[1] === 'login') {
       asked.login += 1
       return { value: isSignedIn ? { exitCode: 0, stdout: 'Logged in using ChatGPT\n', stderr: '' } : { exitCode: 1, stdout: '', stderr: 'Not logged in\n' } } as never
@@ -692,6 +718,54 @@ describe('drawn on the desktop surface', () => {
     expect(out.text).toContain('For a bug report, include these lines:')
     expect(out.text).toContain('codex on PATH · node found · CODEX_HOME default · setting auto')
     expect(out.text).not.toContain('/h/')
+  })
+
+  test('on Windows: the time zone from the registry, the home folder from USERPROFILE, no Codex', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    const asked = host(on, { isWindows: true })
+    await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+    await clock.advance(1_000)
+    const done = $.command.run({ command: 'usage-glance', args: '' } as never)
+    await clock.advance(1_000)
+    const out = (await done) as { text?: string }
+    expect(asked.registry).toEqual([
+      'C:\\WINDOWS\\System32\\reg.exe',
+      'query',
+      'HKLM\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation',
+      '/v',
+      'ActiveTimeBias',
+    ])
+    expect(out.text).toContain('UTC-07:00')
+    expect(out.text).toContain('Codex   shown on macOS only')
+    // The account is read from USERPROFILE, where Claude Code keeps it, not the HOME a shell set.
+    expect(out.text).toContain('account known')
+    expect(asked.files.some(f => f.includes('msys-home'))).toBe(false)
+    expect(asked.codex).toBe(0)
+  })
+
+  test('on Windows, a registry that stops answering keeps the last time zone', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    let answer: string | undefined = '    ActiveTimeBias    REG_DWORD    0xfffffe20\r\n'
+    const asked = host(on, { isWindows: true, registry: () => answer })
+    await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+    await clock.advance(1_000)
+    answer = undefined
+    await clock.advance(2 * HOUR)
+    expect(asked.registryReads).toBeGreaterThan(1)
+    const done = $.command.run({ command: 'usage-glance', args: '' } as never)
+    await clock.advance(1_000)
+    expect(((await done) as { text?: string }).text).toContain('UTC+08:00')
+  })
+
+  test('on macOS the registry is never asked', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    const asked = host(on)
+    await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+    await clock.advance(1_000)
+    expect(asked.registry).toEqual([])
   })
 
   test('with no Claude login the plan-usage request stops instead of retrying every minute', async ($, on) => {

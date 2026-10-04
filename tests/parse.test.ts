@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { parseClaudeUsage, parseCodexLimits, readingFromHeaders } from '../hooks/parse'
+import { offsetFromDate, offsetFromRegistry, parseClaudeUsage, parseCodexLimits, readingFromHeaders } from '../hooks/parse'
 
 const MIN = 60_000
 const HOUR = 60 * MIN
@@ -197,5 +197,41 @@ describe('the Codex rate limits', () => {
   test('no bucket at all is no reading', () => {
     expect(parseCodexLimits({ ordinaryUsageAllowed: true }, NOW)).toBe(null)
     expect(parseCodexLimits(null, NOW)).toBe(null)
+  })
+})
+
+describe('the time zone', () => {
+  // What `reg query HKLM\\...\\TimeZoneInformation /v ActiveTimeBias` prints on Windows.
+  const reg = (value: string) =>
+    `\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation\r\n    ActiveTimeBias    REG_DWORD    ${value}\r\n\r\n`
+
+  test('date +%z on macOS', () => {
+    expect(offsetFromDate('+0800\n')).toBe(480)
+    expect(offsetFromDate('-0330\n')).toBe(-210)
+    expect(offsetFromDate('+0000\n')).toBe(0)
+  })
+
+  test('the Windows registry: a negative bias is a zone east of UTC', () => {
+    expect(offsetFromRegistry(reg('0xfffffe20'))).toBe(480)
+    expect(offsetFromRegistry(reg('0xfffffeb6'))).toBe(330)
+  })
+
+  test('the Windows registry: a positive bias is a zone west of UTC', () => {
+    // What Los Angeles reads in summer, daylight saving included: UTC-07:00.
+    expect(offsetFromRegistry(reg('0x1a4'))).toBe(-420)
+  })
+
+  test('the Windows registry: UTC', () => {
+    expect(offsetFromRegistry(reg('0x0'))).toBe(0)
+  })
+
+  test('anything else is no offset, never UTC', () => {
+    expect(offsetFromDate('Sun Oct  4 21:30:00 CST 2026\n')).toBeNull()
+    expect(offsetFromDate('+2400')).toBeNull()
+    expect(offsetFromDate('+0060')).toBeNull()
+    expect(offsetFromRegistry('ERROR: The system was unable to find the specified registry key or value.\r\n')).toBeNull()
+    expect(offsetFromRegistry('')).toBeNull()
+    expect(offsetFromRegistry(reg('0x7fffffff'))).toBeNull()
+    expect(offsetFromRegistry(reg('0xfffffe20 junk'))).toBeNull()
   })
 })

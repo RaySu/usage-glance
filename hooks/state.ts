@@ -115,6 +115,8 @@ export const rt = {
   codexPath: '',
   pathEnv: '',
   hasCodex: false,
+  /** The macOS command-line tools the log scan runs are here (not on Windows); assumed until Codex is probed. */
+  hasScanTools: true,
   codexProbedAt: 0,
   utcOffsetMin: 0,
   offsetAt: 0,

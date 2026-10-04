@@ -9,7 +9,7 @@ import type { ClaudeReading, CodexAuth, CodexReading, CodexTask, LimitWindow, Vi
 
 import { HOUR, MIN, WAKE_HOLD_MS, bandModel, clock, codexMode, countdown, floor, pad, pctShown } from './model'
 import type { Slot, WindowModel } from './model'
-import { parseClaudeUsage, parseCodexLimits, readingFromHeaders } from './parse'
+import { offsetFromDate, offsetFromRegistry, parseClaudeUsage, parseCodexLimits, readingFromHeaders } from './parse'
 import {
   EMPTY,
   RETRY_LATER_MS,
@@ -144,14 +144,27 @@ async function adopt($: Engine) {
 
 // --- host facts --------------------------------------------------------------
 
-/** Local UTC offset from the host clock, since the module has no time zone of its own. */
+/**
+ * Local UTC offset from the host, since the module has no time zone of its own: `date`
+ * on macOS, the registry on Windows (asked only when `date` does not answer). Neither
+ * answering keeps the last offset.
+ */
 async function refreshOffset($: Engine) {
   rt.offsetAt = await $.clock.now()
+  let offset: number | null = null
   try {
-    const z = (await $.process.run(['/bin/date', '+%z'], { timeoutMs: 3_000 })).stdout.trim()
-    const m = /^([+-])(\d\d)(\d\d)$/.exec(z)
-    if (m) rt.utcOffsetMin = (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3]))
+    const run = await $.process.run(['/bin/date', '+%z'], { timeoutMs: 3_000 })
+    if (run.exitCode === 0) offset = offsetFromDate(run.stdout)
   } catch {}
+  if (offset === null) {
+    const windows = (await $.env.get('SystemRoot')) || 'C:\\Windows'
+    const zoneKey = 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation'
+    try {
+      const run = await $.process.run([`${windows}\\System32\\reg.exe`, 'query', zoneKey, '/v', 'ActiveTimeBias'], { timeoutMs: 3_000 })
+      if (run.exitCode === 0) offset = offsetFromRegistry(run.stdout)
+    } catch {}
+  }
+  if (offset !== null) rt.utcOffsetMin = offset
   if ((await read($, view)).utcOffsetMin !== rt.utcOffsetMin) await update($, view, v => ({ ...v, utcOffsetMin: rt.utcOffsetMin }))
 }
 
@@ -160,7 +173,9 @@ async function refreshOffset($: Engine) {
  * the Node version managers' included.
  */
 async function setUpPath($: Engine) {
-  rt.home = (await $.env.get('HOME')) ?? ''
+  // The home folder as Node (so Claude Code) finds it: USERPROFILE on Windows, even when a shell set HOME there.
+  const isWindows = (await $.env.get('OS')) === 'Windows_NT'
+  rt.home = (isWindows ? await $.env.get('USERPROFILE') : await $.env.get('HOME')) ?? ''
   rt.codexHome = (await $.env.get('CODEX_HOME')) || `${rt.home}/.codex`
   const path = (await $.env.get('PATH')) ?? ''
   const home = rt.home
@@ -195,12 +210,12 @@ async function probeCodex($: Engine) {
     if (!rt.codexPath && (await $.fs.exists(bundled))) rt.codexPath = bundled
   }
   // The log scan runs the macOS command-line tools; without them (Windows) Codex is left out.
-  let hasTools = true
+  rt.hasScanTools = true
   for (const tool of ['/usr/bin/find', '/usr/bin/stat', '/usr/bin/head', '/usr/bin/tail', '/usr/bin/grep']) {
-    if (!(await $.fs.exists(tool))) hasTools = false
+    if (!(await $.fs.exists(tool))) rt.hasScanTools = false
   }
   rt.hasCodex =
-    rt.setting !== 'never' && hasTools && !!rt.nodePath && !!rt.codexPath && (await $.fs.exists(rt.codexHome))
+    rt.setting !== 'never' && rt.hasScanTools && !!rt.nodePath && !!rt.codexPath && (await $.fs.exists(rt.codexHome))
   // A Codex found is drawn once its mode is known (refreshCodexMode); one lost goes now.
   if (!rt.hasCodex) await refreshCodexMode($, rt.codexProbedAt)
 }
@@ -813,13 +828,15 @@ async function report($: Engine) {
   const missing =
     rt.setting === 'never'
       ? 'turned off in the settings'
-      : !rt.codexPath
-        ? 'not found on this machine'
-        : !rt.nodePath
-          ? 'found, but not node, which reads its limits'
-          : !(await $.fs.exists(rt.codexHome))
-            ? 'found, but not its folder (never run, or CODEX_HOME points elsewhere)'
-            : 'found, but not the macOS command-line tools it needs'
+      : !rt.hasScanTools
+        ? 'shown on macOS only'
+        : !rt.codexPath
+          ? 'not found on this machine'
+          : !rt.nodePath
+            ? 'found, but not node, which reads its limits'
+            : !(await $.fs.exists(rt.codexHome))
+              ? 'found, but not its folder (never run, or CODEX_HOME points elsewhere)'
+              : 'found, not read yet'
   const codexLine = !v.hasCodex
     ? missing
     : [
