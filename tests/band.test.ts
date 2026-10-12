@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 
 import type { On } from 'claude-code'
 
@@ -1123,5 +1124,97 @@ describe('drawn on the desktop surface', () => {
       props: { hasSurvey: true, isWorking: false, maxRows: 12, bodyColumns: 95 } as never,
     })
     expect(await ui.find({ type: 'Text', text: 'Claude' })).toBe(undefined)
+  })
+})
+
+// The prompt cache is kept warm by each answered request of the main loop, not by turn ends.
+describe('cache cold', () => {
+  const props = { hasSurvey: false, isWorking: false, maxRows: 12, bodyColumns: 95 } as never
+  const usage = { inputTokens: 10, outputTokens: 10, cacheReadTokens: 50_000, cacheWriteTokens: 0, model: 'claude-opus-5-5' } as never
+  const context = { context: { tokens: 60_000, window: 200_000, percent: 30 }, rateLimits: [], changed: ['context'] } as never
+
+  async function step($: Engine, agentId?: string) {
+    const s = $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 3, ...(agentId ? { agentId } : {}) } as never)
+    const chunks: unknown[] = []
+    for (let r = await s.next(); ; r = await s.next()) {
+      if (r.done) return { chunks, result: r.value }
+      chunks.push(r.value)
+    }
+  }
+
+  async function texts($: Engine) {
+    // A context-only measurement brings the view's clock up to date.
+    await $.session.measure(context)
+    const ui = await $.ui.mount({ plugin: 'usage-glance', surface: 'desktop', component: 'AbovePrompt', props })
+    return (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  }
+
+  /** The engine beneath: each request answers, unless `reply.isAnswered` is false. */
+  function mocks(on: On) {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    const reply = { isAnswered: true }
+    on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'engine', ref: 1 }) as never)
+    on('session.measure', (_$, e) => ({ changed: e.changed }))
+    on('turn.step', async function* (_$, e) {
+      if (!reply.isAnswered) return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: null, usage: null } as never
+      yield { kind: 'text', index: 0, text: 'ok' } as never
+      return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'tool_use', usage } as never
+    })
+    on('turn.complete', () => ({ text: '' }) as never)
+    return { clock, reply }
+  }
+
+  test('cold after an hour with no request, warm again after one', async ($, on) => {
+    const { clock } = mocks(on)
+    await $.session.measure(context)
+    await step($)
+    await clock.advance(70 * MIN)
+    expect(await texts($)).toContain('Cache cold')
+    await step($)
+    expect(await texts($)).not.toContain('Cache cold')
+  })
+
+  test('a turn still running after an hour, its requests going on, is not cold', async ($, on) => {
+    const { clock } = mocks(on)
+    await $.session.measure(context)
+    await step($)
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't0', reason: 'answer' } as never)
+    await step($)
+    // The person takes 50 minutes to answer a question, twice; the turn never ends.
+    await clock.advance(50 * MIN)
+    await step($)
+    await clock.advance(50 * MIN)
+    expect(await texts($)).not.toContain('Cache cold')
+  })
+
+  test("a subagent's requests and turns leave the main loop's cache cold", async ($, on) => {
+    const { clock } = mocks(on)
+    await $.session.measure(context)
+    await step($)
+    await clock.advance(50 * MIN)
+    await step($, 'agent-1')
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', agentId: 'agent-1', reason: 'answer' } as never)
+    await clock.advance(20 * MIN)
+    expect(await texts($)).toContain('Cache cold')
+  })
+
+  test('a request with no answer, or a turn interrupted or failed, does not warm it', async ($, on) => {
+    const { clock, reply } = mocks(on)
+    await $.session.measure(context)
+    await step($)
+    await clock.advance(70 * MIN)
+    reply.isAnswered = false
+    await step($)
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't1', reason: 'aborted' } as never)
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'error' } as never)
+    expect(await texts($)).toContain('Cache cold')
+  })
+
+  test('the reply is passed on as it came', async ($, on) => {
+    mocks(on)
+    const { chunks, result } = await step($)
+    expect(chunks).toEqual([{ kind: 'text', index: 0, text: 'ok' }])
+    expect(result).toEqual({ turnId: 't1', index: 0, answer: 'ok', toolUses: [], stopReason: 'tool_use', usage })
   })
 })

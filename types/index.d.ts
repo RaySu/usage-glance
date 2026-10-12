@@ -63,6 +63,7 @@ export type View = {
   contextTokens: number | null
   isContextShown: boolean
   costUsd: number | null
+  /** When the main loop last sent a request that was answered: what keeps the prompt cache warm. */
   lastTurnAt: number | null
   now: number
   /** Local UTC offset in minutes, from the host's `date +%z`. */

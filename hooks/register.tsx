@@ -262,6 +262,15 @@ async function takeMeasure(
   if (reading) await saveClaude($, reading)
 }
 
+/** A request of the main loop sent at `sentAt` was answered: the prompt cache is warm from then. */
+async function markWarm($: Engine, sentAt: number) {
+  // Every write redraws the band, and a busy turn makes requests seconds apart.
+  const last = (await read($, view)).lastTurnAt
+  if (last !== null && sentAt - last < MIN) return
+  const now = await $.clock.now()
+  await update($, view, v => ({ ...v, lastTurnAt: Math.max(v.lastTurnAt ?? 0, sentAt), now }))
+}
+
 // --- Claude: the plan usage request the app itself makes ---------------------
 
 async function fetchClaude($: Engine, isForced = false) {
@@ -1050,10 +1059,21 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('turn.complete', async ($, e, next) => {
-    const now = await $.clock.now()
-    await update($, view, v => ({ ...v, lastTurnAt: now, now }))
-    return next(e)
+  // The cache lives on each request, not each turn: a turn can run for hours (the
+  // person answering its questions in between), and one that ends interrupted or failed
+  // sent nothing. A subagent's requests use a cache of their own.
+  on('turn.step', async function* ($, e, next) {
+    const sentAt = e.agentId ? 0 : await $.clock.now()
+    const r = yield* next(e)
+    // No stop reason: no response arrived, so the request may never have reached the cache.
+    if (!e.agentId && r.stopReason !== null) {
+      try {
+        await markWarm($, sentAt)
+      } catch (err) {
+        logFailure($, 'noting a request', err)
+      }
+    }
+    return r
   })
 
   on('command.run', { command: 'usage-glance' }, async $ => {
